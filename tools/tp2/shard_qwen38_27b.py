@@ -42,8 +42,6 @@ GDN_CONV = Rule("cols", (2048, 2048, 6144))     # (4, 10240) taps x channels
 MLP_GATE_UP = Rule("rows", (17408, 17408))
 K6144 = Rule("cols", (6144,))
 K17408 = Rule("cols", (17408,))
-
-
 def rule_for(name: str) -> Rule | None:
     if name.startswith("vision/") or not (name.startswith("text/layers/") or name.startswith("mtp/layer/")):
         return None

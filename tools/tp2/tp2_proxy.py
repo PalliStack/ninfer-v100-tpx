@@ -52,6 +52,8 @@ class Supervisor:
                     "NINFER_TP_MAILBOX_FILE": self.args.lockstep_file + ".mailbox"})
         if self.args.nccl_p2p == "off":
             env["NCCL_P2P_DISABLE"] = "1"   # GPU-to-GPU direct access is broken on the dev machine
+            env["NINFER_TP_NVLINK"] = "0"   # bypass NVLink IPC probe on plain PCIe
+        env.setdefault("NINFER_SM70_LONG_SPLIT_KEYS", "1920")
         if r == 1:
             for kv in self.args.rank1_env:   # test hooks only
                 k, v = kv.split("=", 1)
