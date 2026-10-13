@@ -46,7 +46,11 @@ struct alignas(64) SharedBlock {
     std::uint64_t magic;
     std::uint64_t pad0[7];
     std::atomic<std::uint64_t> published[2];  // last exchanged seq per rank
-    std::uint64_t pad1[6];
+    // Set by a rank whose engine failed so its peer aborts with a cause instead of waiting out the
+    // lockstep timeout. Placed in what was padding: `published` must stay at offset 64 because the
+    // TP2 proxy reads the unit counters there.
+    std::atomic<std::uint64_t> poison;
+    std::uint64_t pad1[5];
     Record records[2][2];                     // [rank][seq & 1]
 };
 
@@ -135,6 +139,13 @@ class Lockstep {
 
     [[nodiscard]] std::uint64_t peer_pending() const noexcept { return peer_pending_; }
 
+    // Called by a rank whose engine failed: its peer then fails loudly at the next exchange instead
+    // of waiting out the lockstep timeout (the proxy would otherwise restart both ranks silently
+    // after its own stall window).
+    void poison_peer() noexcept {
+        if (block_ != nullptr) { block_->poison.store(1, std::memory_order_release); }
+    }
+
     template <class T>
     static std::uint64_t hash_tokens(std::span<const T> tokens,
                                      std::uint64_t h = 1469598103934665603ULL) noexcept {
@@ -157,6 +168,10 @@ class Lockstep {
         const auto start = std::chrono::steady_clock::now();
         std::uint32_t spins = 0;
         for (;;) {
+            if (block_->poison.load(std::memory_order_acquire) != 0) {
+                lockstep_fatal("peer engine failed (poison set) while waiting for unit " +
+                               std::to_string(seq));
+            }
             const std::uint64_t seen = block_->published[peer].load(std::memory_order_acquire);
             if (seen == seq || seen == seq + 1) { break; }
             if (seen > seq + 1) {

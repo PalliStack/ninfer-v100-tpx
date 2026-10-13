@@ -1021,6 +1021,12 @@ private:
         return CancellationFlagView{&request->cancelled};
     }
 
+    [[nodiscard]] static std::uint64_t fault_after_units_from_env() {
+        const char* value = std::getenv("NINFER_TP_FAIL_WORKER_AFTER_UNITS");
+        if (value == nullptr) { return 0; }
+        return std::strtoull(value, nullptr, 10);
+    }
+
     [[nodiscard]] static std::chrono::milliseconds deadline_skew_from_env() {
         const char* value = std::getenv("NINFER_TP_DEADLINE_SKEW_MS");
         if (value == nullptr) { return std::chrono::milliseconds{0}; }
@@ -2159,6 +2165,9 @@ private:
         } catch (...) {
             std::fprintf(stderr, "[ninfer] engine worker failed: unknown exception\n");
         }
+        // Tell the peer immediately (poison) so a peer sitting at a host exchange fails with this
+        // cause instead of waiting out its lockstep timeout.
+        if (auto* lockstep = tp::Lockstep::instance()) { lockstep->poison_peer(); }
         std::deque<std::shared_ptr<Request>> pending;
         {
             std::lock_guard lock(queue_mutex_);
@@ -2180,6 +2189,18 @@ private:
         if (materializing_request != nullptr) { complete_error(materializing_request, error); }
         for (const auto& request : pending) { complete_error(request, error); }
         publish_runtime_stats();
+        if (tp::Lockstep::instance() != nullptr) {
+            // A failed worker cannot serve again (failed_ stays set), so the process is only useful
+            // for the peer: leaving it does not unblock a peer stuck inside a collective GPU unit,
+            // which is the measured case (the peer spun in prefill until cudaErrorLaunchFailure).
+            // A short drain lets the HTTP threads finish the error responses, then the exit is what
+            // the peer's collectives and the proxy's liveness check notice immediately.
+            std::fflush(stderr);
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            std::fprintf(stderr, "[ninfer] engine failed under TP lockstep; terminating this rank\n");
+            std::fflush(stderr);
+            std::abort();
+        }
     }
 
     void worker_loop() noexcept {
@@ -2208,6 +2229,10 @@ private:
 
             std::unique_lock execution_lock(execution_mutex_);
             try {
+                if (fault_after_units_ != 0 && ++worker_units_ >= fault_after_units_) {
+                    throw std::runtime_error(
+                        "injected worker failure (NINFER_TP_FAIL_WORKER_AFTER_UNITS)");
+                }
                 set_host_work_class(HostWorkClass::Control);
                 HostPhaseMeasurement boundary = begin_host_phase();
                 const bool have_pending       = expire_pending_requests();
@@ -2319,6 +2344,10 @@ private:
     // comparisons so a peer can be driven to expire a queued request at a different time. It exists
     // only to observe the divergence that the agreed-removal rule prevents; 0 is the shipping value.
     const std::chrono::milliseconds deadline_skew_{deadline_skew_from_env()};
+    // Test hook (same shape as NINFER_TP_LOCKSTEP_FAULT_UNIT): fails this rank's worker after N
+    // worker iterations, to prove a rank failure reaches its peer immediately. 0 ships.
+    const std::uint64_t fault_after_units_{fault_after_units_from_env()};
+    std::uint64_t worker_units_ = 0;
     ResourceManagement resources_;
 
     mutable std::mutex execution_mutex_;
