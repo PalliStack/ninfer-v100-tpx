@@ -274,7 +274,11 @@ GenerationService::acquire_request_lifetime(DeadlinePolicy deadline_policy) cons
     const auto started = Clock::now();
     {
         std::lock_guard lock(request_capacity_->mutex);
-        if (request_capacity_->active >= request_capacity_->maximum) {
+        // Rank-local: `active` counts requests whose response has not been released, and the two
+        // ranks release at different times (rank 0 answers the client, rank 1 is drained by the
+        // proxy). Under TP the symmetric bound is the proxy's, enforced before it dispatches.
+        if (request_capacity_->active >= request_capacity_->maximum &&
+            !ninfer::runtime::tp::lockstep_enabled()) {
             throw_request_error(ninfer::RequestError(RequestErrorKind::Overloaded,
                                                      "inference request queue is full"));
         }

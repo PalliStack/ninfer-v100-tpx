@@ -20,6 +20,15 @@
 
 namespace ninfer::runtime {
 
+// Why a request left the engine without producing a normal completion. `Cancelled` is the client
+// going away (HTTP 499); `QueueExpired` is the queue deadline (`--pending-timeout-ms`, HTTP 503
+// `request_queue_timeout`). Both are decided once per GPU unit under TP lockstep.
+enum class QueueTerminationCause : std::uint8_t {
+    None,
+    Cancelled,
+    QueueExpired,
+};
+
 enum class RequestEngineHostPhase : std::uint8_t {
     Boundary,
     CommitOutput,
@@ -176,6 +185,13 @@ struct RequestRecord {
     std::optional<LaneId> lane;
     std::optional<SequenceHandle> sequence;
     std::atomic<bool> cancelled{false};
+    // This rank's own queue deadline has passed. It is an intent, not an action: under TP lockstep a
+    // queued request is never dropped on one rank's view, so the flag does not change engine state —
+    // the request is admitted like on the peer and its answer reports the missed deadline (503).
+    std::atomic<bool> expired{false};
+    // Why the request ended, preserved until the response is rendered. The reported cause follows
+    // this rank's own observation (rank 0 owns the client-facing response).
+    QueueTerminationCause terminal_cause = QueueTerminationCause::None;
     EngineRequestState model_state        = EngineRequestState::Waiting;
     bool capture_pending                  = false;
     EngineRequestState post_capture_state = EngineRequestState::Prefill;

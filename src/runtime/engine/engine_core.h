@@ -173,7 +173,10 @@ public:
         if (pending_deadline == Clock::time_point{}) {
             pending_deadline = submitted + pending_timeout_;
         }
-        if (submitted >= pending_deadline) {
+        // While a peer exists, a request that is already past its deadline is still submitted: the
+        // peer holds it too, and only the agreed per-unit mask may end it. Rejecting here would give
+        // the two ranks different FIFOs and stall the pair.
+        if (submitted >= pending_deadline && !lockstep_running()) {
             throw RequestError(RequestErrorKind::QueueTimeout,
                                "inference request expired before submission");
         }
@@ -186,7 +189,11 @@ public:
                 throw RequestError(RequestErrorKind::Unavailable,
                                    "inference engine is unavailable");
             }
-            if (outstanding_ >= max_outstanding_) {
+            // The outstanding bound is rank-local too: it counts requests whose response has not been
+            // released yet, and the two ranks release at different times (rank 0 answers the client,
+            // rank 1 is drained by the proxy). Under TP the symmetric bound is the proxy's, enforced
+            // before it dispatches to either rank.
+            if (outstanding_ >= max_outstanding_ && !lockstep_running()) {
                 throw RequestError(RequestErrorKind::Overloaded, "inference request queue is full");
             }
             if (next_request_id_ == 0 || next_publication_order_ == 0) {
@@ -824,6 +831,18 @@ private:
     }
 
     void complete_success(const std::shared_ptr<Request>& request, FinishReason reason) {
+        if (request->terminal_cause == QueueTerminationCause::None &&
+            request->expired.load(std::memory_order_acquire)) {
+            // The expiry intent is only ever raised while the request waits in the FIFO, so reaching
+            // completion with it set means the client's queue deadline was missed. The workload ran
+            // (both ranks stayed in step) but the answer is the 503 the contract promises.
+            request->terminal_cause = QueueTerminationCause::QueueExpired;
+            complete_error(request,
+                           std::make_exception_ptr(RequestError(
+                               RequestErrorKind::QueueTimeout,
+                               "inference request expired while waiting for admission")));
+            return;
+        }
         HostPhaseMeasurement completion = begin_host_phase();
         double prompt_wall_seconds      = 0.0;
         double generation_wall_seconds  = 0.0;
@@ -962,10 +981,43 @@ private:
         return CancellationFlagView{&request->cancelled};
     }
 
+    [[nodiscard]] static std::chrono::milliseconds deadline_skew_from_env() {
+        const char* value = std::getenv("NINFER_TP_DEADLINE_SKEW_MS");
+        if (value == nullptr) { return std::chrono::milliseconds{0}; }
+        return std::chrono::milliseconds(std::atoll(value));
+    }
+
+    // A queue deadline reached on this rank's clock. `deadline_skew_` is 0 outside the test hook, so
+    // this is `Clock::now() >= request->deadline`.
+    [[nodiscard]] bool queue_deadline_reached(Clock::time_point now,
+                                              const std::shared_ptr<Request>& request) const noexcept {
+        return now + deadline_skew_ >= request->deadline;
+    }
+
     [[nodiscard]] bool cancelled_on_this_rank(
         const std::shared_ptr<Request>& request) const noexcept {
         return tp::Lockstep::instance() == nullptr &&
                request->cancelled.load(std::memory_order_acquire);
+    }
+
+    // A peer is running the same request, so rank-local (wall-clock, socket, response-release)
+    // inputs may only raise intents here; every state change goes through an agreed exchange.
+    [[nodiscard]] static bool lockstep_running() noexcept {
+        return tp::Lockstep::instance() != nullptr;
+    }
+
+    // Why this rank believes the request ended. Under TP a lane can also be ended by the peer's
+    // intent alone (the agreed mask is an OR), which this rank cannot tell apart from its own client
+    // disconnect, so that case reports the client-disconnect cause.
+    [[nodiscard]] static QueueTerminationCause termination_cause(
+        const std::shared_ptr<Request>& request) noexcept {
+        if (request->cancelled.load(std::memory_order_acquire)) {
+            return QueueTerminationCause::Cancelled;
+        }
+        if (request->expired.load(std::memory_order_acquire)) {
+            return QueueTerminationCause::QueueExpired;
+        }
+        return QueueTerminationCause::Cancelled;
     }
 
     bool settle_terminal_requests(HostPhaseMeasurement& boundary) {
@@ -1031,7 +1083,17 @@ private:
             if (scheduler_.prefill_lane() == lane) { scheduler_.clear_prefill_lane(lane); }
             append_output(request, request->output.commit_preview());
             finish_engine_phase(boundary, EngineHostPhase::Boundary);
-            complete_success(request, FinishReason::Cancelled);
+            request->terminal_cause = termination_cause(request);
+            if (request->terminal_cause == QueueTerminationCause::QueueExpired) {
+                // The queue deadline ended this request, so it keeps the 503 request_queue_timeout
+                // contract the client was promised; only a client disconnect reports as cancelled.
+                complete_error(request,
+                               std::make_exception_ptr(RequestError(
+                                   RequestErrorKind::QueueTimeout,
+                                   "inference request expired while waiting for admission")));
+            } else {
+                complete_success(request, FinishReason::Cancelled);
+            }
             remove_completed_slot(lane);
             boundary = begin_host_phase();
             changed  = true;
@@ -1050,15 +1112,22 @@ private:
                 if (cancelled_on_this_rank(*it)) {
                     cancelled.push_back(*it);
                     it = pending_.erase(it);
-                } else if (now >= (*it)->deadline) {
-                    // Queue expiry stays rank-local: both ranks derive it from the deadline their own
-                    // request lifetime started with, so the two decisions differ only by the arrival
-                    // skew between the ranks.
-                    expired.push_back(*it);
-                    it = pending_.erase(it);
-                } else {
-                    ++it;
+                    continue;
                 }
+                if (queue_deadline_reached(now, *it)) {
+                    if (lockstep_running()) {
+                        // Under TP lockstep the local deadline is only an intent: the request stays
+                        // in the FIFO and is admitted like on the peer, so both ranks keep doing the
+                        // same work. It is reported as the expired queue request when it finishes
+                        // (complete_success) instead of being dropped on this rank alone.
+                        (*it)->expired.store(true, std::memory_order_release);
+                    } else {
+                        expired.push_back(*it);
+                        it = pending_.erase(it);
+                        continue;
+                    }
+                }
+                ++it;
             }
             have_pending = !pending_.empty();
         }
@@ -1456,10 +1525,19 @@ private:
                                          << 2) |
                                         (progress.complete ? 1U : 0U) |
                                         (progress.capture ? 2U : 0U);
+            // The Program only clears a lane that is not holding staged prompt state: measured, an
+            // abort is rejected once the prefill unit has reached the admitted prompt frontier (the
+            // next unit commits it). Deferring there costs one unit; aborting there kills the engine,
+            // and a deferred request is reported by the override in complete_success().
+            const bool lane_clearable =
+                request->admitted_begin.has_value() &&
+                request->computed_prompt_tokens <
+                    (request->admitted_begin->prompt_tokens -
+                     request->admitted_begin->reused_prompt_tokens);
             const auto agreed = tp_agree_cancellations(*lockstep, tp::UnitKind::Prefill, count,
                                                        hash, request->computed_prompt_tokens);
             resolve_prefill_progress(request, std::move(progress), agreed);
-            if (agreed[lane] && slots_[lane] == request) {
+            if (agreed[lane] && slots_[lane] == request && lane_clearable) {
                 // Both ranks abort the partially prefilled request after the same chunk.
                 HostPhaseMeasurement boundary = begin_host_phase();
                 cancel_active_requests(agreed, boundary);
@@ -1650,13 +1728,18 @@ private:
     [[nodiscard]] AdmissionProgress
     admit_planned_request(const std::shared_ptr<Request>& request,
                           typename ResourceManagement::Choice&& choice, AdmissionGrant grant) {
-        if (Clock::now() >= request->deadline) {
-            const AdmissionProgress progress = remove_pending_error(
-                request, std::make_exception_ptr(RequestError(
-                             RequestErrorKind::QueueTimeout,
-                             "inference request expired while waiting for admission")));
-            if (progress == AdmissionProgress::ControlProgress) { request_admission_check(); }
-            return progress;
+        if (queue_deadline_reached(Clock::now(), request)) {
+            if (lockstep_running()) {
+                // Intent only: the peer holds the same request, so the FIFO is left unchanged here.
+                request->expired.store(true, std::memory_order_release);
+            } else {
+                const AdmissionProgress progress = remove_pending_error(
+                    request, std::make_exception_ptr(RequestError(
+                                 RequestErrorKind::QueueTimeout,
+                                 "inference request expired while waiting for admission")));
+                if (progress == AdmissionProgress::ControlProgress) { request_admission_check(); }
+                return progress;
+            }
         }
         if (cancelled_on_this_rank(request)) {
             if (!erase_pending(request)) { return AdmissionProgress::None; }
@@ -1756,13 +1839,18 @@ private:
                 }
                 continue;
             }
-            if (Clock::now() >= head->deadline) {
-                (void)remove_pending_error(
-                    head, std::make_exception_ptr(RequestError(
-                              RequestErrorKind::QueueTimeout,
-                              "inference request expired while waiting for admission")));
-                control_progress = true;
-                continue;
+            if (queue_deadline_reached(Clock::now(), head)) {
+                if (!lockstep_running()) {
+                    (void)remove_pending_error(
+                        head, std::make_exception_ptr(RequestError(
+                                  RequestErrorKind::QueueTimeout,
+                                  "inference request expired while waiting for admission")));
+                    control_progress = true;
+                    continue;
+                }
+                // Under TP lockstep the head is never dropped here: it is admitted like on the peer,
+                // so both ranks leave the FIFO identically; the answer is the expired queue request.
+                head->expired.store(true, std::memory_order_release);
             }
 
             try {
@@ -1833,13 +1921,17 @@ private:
                     }
                     continue;
                 }
-                if (Clock::now() >= candidate->deadline) {
-                    (void)remove_pending_error(
-                        candidate, std::make_exception_ptr(RequestError(
-                                       RequestErrorKind::QueueTimeout,
-                                       "inference request expired while waiting for admission")));
-                    control_progress = true;
-                    continue;
+                if (queue_deadline_reached(Clock::now(), candidate)) {
+                    if (!lockstep_running()) {
+                        (void)remove_pending_error(
+                            candidate, std::make_exception_ptr(RequestError(
+                                           RequestErrorKind::QueueTimeout,
+                                           "inference request expired while waiting for admission")));
+                        control_progress = true;
+                        continue;
+                    }
+                    // Intent only: the candidate is never dropped on this rank's clock.
+                    candidate->expired.store(true, std::memory_order_release);
                 }
                 try {
                     ensure_base_plan(candidate);
@@ -2010,6 +2102,15 @@ private:
     // The worker holds execution_mutex_ across the failing operation and this cleanup, so no
     // Program introspection can observe a partially cleared physical state.
     void fail_all_locked(std::exception_ptr error) noexcept {
+        // An engine-wide failure must never be silent: the serve layer only reports a generic 500, so
+        // the cause is written here for the rank log.
+        try {
+            if (error != nullptr) { std::rethrow_exception(error); }
+        } catch (const std::exception& exception) {
+            std::fprintf(stderr, "[ninfer] engine worker failed: %s\n", exception.what());
+        } catch (...) {
+            std::fprintf(stderr, "[ninfer] engine worker failed: unknown exception\n");
+        }
         std::deque<std::shared_ptr<Request>> pending;
         {
             std::lock_guard lock(queue_mutex_);
@@ -2166,6 +2267,10 @@ private:
     const std::uint32_t max_concurrency_;
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;
+    // Test hook (same shape as NINFER_TP_LOCKSTEP_FAULT_UNIT): offsets this rank's queue-deadline
+    // comparisons so a peer can be driven to expire a queued request at a different time. It exists
+    // only to observe the divergence that the agreed-removal rule prevents; 0 is the shipping value.
+    const std::chrono::milliseconds deadline_skew_{deadline_skew_from_env()};
     ResourceManagement resources_;
 
     mutable std::mutex execution_mutex_;
