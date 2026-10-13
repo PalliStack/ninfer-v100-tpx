@@ -992,18 +992,27 @@ public:
         return result;
     }
 
-    [[nodiscard]] AbortResult abort(Program& program, LaneId lane, SequenceHandle sequence) {
+    // Terminal abort that tolerates a Program which still holds staged prompt state for the lane.
+    // Measured cause: the prefill unit that reaches the admitted prompt frontier leaves the sequence
+    // un-committed, so the Program refuses to clear it. That is not an engine failure — the lane is
+    // left untouched here, both ranks keep running the request (they agree through the unit mask),
+    // and the request ends by its own completion, reported by the caller instead of killing the
+    // engine (which would fail every other request too). Returns nullopt when the abort was deferred.
+    [[nodiscard]] std::optional<AbortResult> try_abort(Program& program, LaneId lane,
+                                                       SequenceHandle sequence) {
         if (!std::holds_alternative<std::monostate>(transaction_) ||
             program.has_context_transaction()) {
-            throw std::logic_error("terminal abort overlaps an open resource transaction");
+            return std::nullopt;
         }
-        if (lanes_.at(lane.value) == LogicalLaneState::Active) {
+        const LogicalLaneState previous = lanes_.at(lane.value);
+        if (previous == LogicalLaneState::Active) {
             lanes_[lane.value] = LogicalLaneState::TerminalPending;
         }
-        require_lane(lane, LogicalLaneState::TerminalPending);
+        if (lanes_.at(lane.value) != LogicalLaneState::TerminalPending) { return std::nullopt; }
         AbortResult result = program.abort(sequence);
         if (result.status != ConsumeStatus::Consumed) {
-            throw std::logic_error("Program did not consume aborted sequence");
+            lanes_[lane.value] = previous;
+            return std::nullopt;
         }
         release_active_references(lane);
         clear_catalog_entry(catalog_.at(active_[lane.value].publication_slot));

@@ -925,21 +925,61 @@ private:
         }
     }
 
+    // Terminations the agreed mask may carry: a lane ends when either rank's client is gone
+    // (cancelled) or either rank's queue deadline passed (expired). Both are intents raised by
+    // rank-local observations that only a unit exchange turns into state, so the mask — never one
+    // rank's own view — decides when a lane stops. Prefill (abort) and decode/commit terminate the
+    // lane on different paths, so the mask has to reach both.
+    // The per-unit cancellation word carries two intents: bits [0, kMaximumConcurrency) are client
+    // disconnects and bits [32, 32 + kMaximumConcurrency) are queue deadlines. Mixing them into the
+    // same uint64 fits the existing record field, so no lockstep protocol or ABI changes.
+    static constexpr std::uint64_t kExpiryMaskShift  = 32;
+    static constexpr std::uint64_t kTerminationMask =
+        (std::uint64_t{1} << kMaximumConcurrency) - 1;
+
+    [[nodiscard]] std::array<bool, kMaximumConcurrency>
+    snapshot_terminations_for_lockstep() const noexcept {
+        std::array<bool, kMaximumConcurrency> terminated{};
+        if (instance_.program->has_context_transaction()) { return terminated; }
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            if (slots_[lane] != nullptr) {
+                terminated[lane] = slots_[lane]->cancelled.load(std::memory_order_acquire) ||
+                                   slots_[lane]->expired.load(std::memory_order_acquire);
+            }
+        }
+        return terminated;
+    }
+
     [[nodiscard]] std::array<bool, kMaximumConcurrency>
     tp_agree_cancellations(tp::Lockstep& lockstep, tp::UnitKind kind, std::uint64_t count,
                            std::uint64_t hash, std::uint64_t position) const {
-        const auto local  = snapshot_cancellations_raw();
+        const auto local   = snapshot_terminations_for_lockstep();
         std::uint64_t mask = 0;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
-            if (local[lane]) { mask |= std::uint64_t{1} << lane; }
+            if (slots_[lane] == nullptr) { continue; }
+            if (slots_[lane]->cancelled.load(std::memory_order_acquire)) {
+                mask |= std::uint64_t{1} << lane;
+            }
+            if (slots_[lane]->expired.load(std::memory_order_acquire)) {
+                mask |= std::uint64_t{1} << (kExpiryMaskShift + lane);
+            }
         }
         const std::uint64_t pending_n = pending_count();
         const std::uint64_t agreed = lockstep.exchange(kind, mask, count, hash, position, pending_n);
         // Both ranks may admit only what both of them already hold (see worker_loop).
         admission_budget_ = std::min(pending_n, lockstep.peer_pending());
+        const std::uint64_t cancel_bits  = agreed & kTerminationMask;
+        const std::uint64_t expired_bits = (agreed >> kExpiryMaskShift) & kTerminationMask;
         std::array<bool, kMaximumConcurrency> cancelled{};
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
-            cancelled[lane] = slots_[lane] != nullptr && ((agreed >> lane) & 1U) != 0;
+            if (slots_[lane] == nullptr) { continue; }
+            const bool by_client  = ((cancel_bits >> lane) & 1U) != 0;
+            const bool by_expiry  = ((expired_bits >> lane) & 1U) != 0;
+            // Adopt the peer's intents so both ranks report the same cause and re-propose them until
+            // a unit actually ends the lane. Raising a flag changes no engine state.
+            if (by_client) { slots_[lane]->cancelled.store(true, std::memory_order_release); }
+            if (by_expiry) { slots_[lane]->expired.store(true, std::memory_order_release); }
+            cancelled[lane] = by_client || by_expiry;
         }
         return cancelled;
     }
@@ -1076,10 +1116,18 @@ private:
             if (!request->sequence || !request->lane || request->lane->value != lane) {
                 throw std::logic_error("active cancellation has no sequence binding");
             }
+            auto aborted = resources_.try_abort(*instance_.program, *request->lane, *request->sequence);
+            if (!aborted) {
+                // The Program still holds staged prompt state for this lane (measured: the prefill
+                // unit that reaches the admitted prompt frontier), so the termination is deferred:
+                // both ranks keep running the request and it ends by its own completion, where
+                // complete_success() reports the cause. Killing the engine here would fail every
+                // other request as well.
+                continue;
+            }
             (void)request->output.preview_terminal(FinishReason::Cancelled);
-            auto aborted = resources_.abort(*instance_.program, *request->lane, *request->sequence);
-            request->generation_timings = aborted.timings;
-            request->speculative_stats  = std::move(aborted.speculative);
+            request->generation_timings = aborted->timings;
+            request->speculative_stats  = std::move(aborted->speculative);
             if (scheduler_.prefill_lane() == lane) { scheduler_.clear_prefill_lane(lane); }
             append_output(request, request->output.commit_preview());
             finish_engine_phase(boundary, EngineHostPhase::Boundary);
