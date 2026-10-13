@@ -1004,6 +1004,9 @@ public:
             program.has_context_transaction()) {
             return std::nullopt;
         }
+        // Ask the Program first: a lane holding staged prompt state is refused, and this way no lane
+        // state is touched for a termination that is going to be deferred anyway.
+        if (!program.can_abort(sequence)) { return std::nullopt; }
         const LogicalLaneState previous = lanes_.at(lane.value);
         if (previous == LogicalLaneState::Active) {
             lanes_[lane.value] = LogicalLaneState::TerminalPending;

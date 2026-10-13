@@ -601,6 +601,7 @@ public:
     [[nodiscard]] DiscardResult abort_pending(PendingBatch&& pending) noexcept;
     [[nodiscard]] FinishResult finish(SequenceHandle sequence) noexcept;
     [[nodiscard]] AbortResult abort(SequenceHandle sequence) noexcept;
+    [[nodiscard]] bool can_abort(SequenceHandle sequence) noexcept;
     [[nodiscard]] ReleaseResult release_continuation(ContinuationHandle&& continuation) noexcept;
     [[nodiscard]] ReleaseResult release_shared_prefix(SharedPrefixHandle&& shared) noexcept;
     void fail_all_cleanup() noexcept;

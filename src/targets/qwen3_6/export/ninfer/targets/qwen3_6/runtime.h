@@ -925,6 +925,9 @@ public:
     [[nodiscard]] DiscardResult<Variant> abort_pending(PendingBatch<Variant>&& pending) noexcept;
     [[nodiscard]] FinishResult<Variant> finish(SequenceHandle<Variant> sequence) noexcept;
     [[nodiscard]] AbortResult<Variant> abort(SequenceHandle<Variant> sequence) noexcept;
+    // Read-only counterpart of abort(): true when the lane can be cleared right now. Callers use it to
+    // defer a termination the Program would refuse instead of attempting it.
+    [[nodiscard]] bool can_abort(SequenceHandle<Variant> sequence) noexcept;
     [[nodiscard]] ReleaseResult<Variant>
     release_continuation(ContinuationHandle<Variant>&& continuation) noexcept;
     [[nodiscard]] ReleaseResult<Variant>

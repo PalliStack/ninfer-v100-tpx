@@ -9316,6 +9316,24 @@ FinishResult ProgramImplCore::finish(SequenceHandle sequence) noexcept {
     return out;
 }
 
+bool ProgramImplCore::can_abort(SequenceHandle sequence) noexcept {
+    if (has_context_transaction() || pending_transaction_ || !valid_sequence(sequence)) {
+        return false;
+    }
+    const std::uint32_t lane       = ContractAccess::lane(sequence).value;
+    const RequestControl& request  = requests[lane];
+    if (request.lifecycle == Lifecycle::Pending || request.lifecycle == Lifecycle::Empty) {
+        return false;
+    }
+    // can_clear_lane_strict is the same predicate clear_lane_strict() gates on; it is declared const
+    // but may throw, exactly as the aborted path assumes.
+    try {
+        return can_clear_lane_strict(active_sequence(lane));
+    } catch (...) {
+        return false;
+    }
+}
+
 AbortResult ProgramImplCore::abort(SequenceHandle sequence) noexcept {
     AbortResult out;
     if (has_context_transaction() || pending_transaction_ || !valid_sequence(sequence)) {

@@ -1579,15 +1579,12 @@ private:
                                          << 2) |
                                         (progress.complete ? 1U : 0U) |
                                         (progress.capture ? 2U : 0U);
-            // The Program only clears a lane that is not holding staged prompt state: measured, an
-            // abort is rejected once the prefill unit has reached the admitted prompt frontier (the
-            // next unit commits it). Deferring there costs one unit; aborting there kills the engine,
-            // and a deferred request is reported by the override in complete_success().
+            // Only attempt the abort when the Program reports the lane as clearable: a lane holding
+            // staged prompt state (measured: the unit that reaches the admitted prompt frontier) is
+            // refused, and a deferred request is ended by complete_success() instead. The predicate is
+            // the Program's own, so the engine no longer predicts clearability from token counters.
             const bool lane_clearable =
-                request->admitted_begin.has_value() &&
-                request->computed_prompt_tokens <
-                    (request->admitted_begin->prompt_tokens -
-                     request->admitted_begin->reused_prompt_tokens);
+                request->sequence.has_value() && instance_.program->can_abort(*request->sequence);
             const auto agreed = tp_agree_cancellations(*lockstep, tp::UnitKind::Prefill, count,
                                                        hash, request->computed_prompt_tokens);
             resolve_prefill_progress(request, std::move(progress), agreed);
