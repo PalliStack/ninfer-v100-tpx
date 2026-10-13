@@ -1,4 +1,5 @@
 #include "targets/qwen3_6_27b_tp2/impl/load/bindings.h"
+#include "targets/qwen3_6_27b_tp2/impl/config.h"
 
 #include "artifact/typed_binding.h"
 #ifdef NINFER_VOLTA_BUILD
@@ -434,7 +435,10 @@ DFlash2Plan bind_dflash2(artifact::Binder& binder, artifact::TensorPlacement pla
             bind_weight(binder, prefix + "attention_conv/kernel_projection", NumericFormat::BF16,
                         {1280, 5120}, placement);
         target.query_key_value = bind_weight(binder, prefix + "attention/query_key_value",
-                                             NumericFormat::W8G32_F16S, {6144, 5120}, placement);
+                                             NumericFormat::W8G32_F16S,
+                                             {DFlashConfig::query_size + 2 * DFlashConfig::kv_size,
+                                              DFlashConfig::hidden},
+                                             placement);
         target.query_norm =
             bind_tensor(prefix + "attention/query_norm", NumericFormat::BF16, {128});
         target.key_norm = bind_tensor(prefix + "attention/key_norm", NumericFormat::BF16, {128});
@@ -448,9 +452,10 @@ DFlash2Plan bind_dflash2(artifact::Binder& binder, artifact::TensorPlacement pla
             bind_weight(binder, prefix + "mlp_conv/kernel_projection", NumericFormat::BF16,
                         {1280, 5120}, placement);
         target.gate_up = bind_weight(binder, prefix + "mlp/gate_up", NumericFormat::W8G32_F16S,
-                                     {34816, 5120}, placement);
+                                     {2 * DFlashConfig::intermediate, DFlashConfig::hidden},
+                                     placement);
         target.down    = bind_weight(binder, prefix + "mlp/down", NumericFormat::W8G32_F16S,
-                                     {5120, 17408}, placement);
+                                     {DFlashConfig::hidden, DFlashConfig::intermediate}, placement);
     }
     out.final_norm = bind_tensor("dflash2/final_norm", NumericFormat::BF16, {5120});
     out.candidate_selector.hidden_projection =
@@ -689,10 +694,14 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
                                               NumericFormat::BF16, {5120, 2, 2});
             target.attention_conv.kernel_projection = materialized_weight(
                 backing, layer_source.attention_conv.kernel_projection, 1280, 5120);
-            target.query_key_value =
-                materialized_weight(backing, layer_source.query_key_value, 6144, 5120);
-            target.context_key   = row_view(target.query_key_value, 4096, 1024);
-            target.context_value = row_view(target.query_key_value, 5120, 1024);
+            target.query_key_value = materialized_weight(
+                backing, layer_source.query_key_value,
+                DFlashConfig::query_size + 2 * DFlashConfig::kv_size, DFlashConfig::hidden);
+            target.context_key =
+                row_view(target.query_key_value, DFlashConfig::query_size, DFlashConfig::kv_size);
+            target.context_value = row_view(
+                target.query_key_value, DFlashConfig::query_size + DFlashConfig::kv_size,
+                DFlashConfig::kv_size);
             target.query_norm    = artifact::materialized_tensor(backing, layer_source.query_norm,
                                                                  NumericFormat::BF16, {128});
             target.key_norm      = artifact::materialized_tensor(backing, layer_source.key_norm,
@@ -705,8 +714,11 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
                 backing, layer_source.mlp_conv.base_kernel, NumericFormat::BF16, {5120, 2, 2});
             target.mlp_conv.kernel_projection =
                 materialized_weight(backing, layer_source.mlp_conv.kernel_projection, 1280, 5120);
-            target.gate_up = materialized_weight(backing, layer_source.gate_up, 34816, 5120);
-            target.down    = materialized_weight(backing, layer_source.down, 5120, 17408);
+            target.gate_up = materialized_weight(backing, layer_source.gate_up,
+                                                 2 * DFlashConfig::intermediate,
+                                                 DFlashConfig::hidden);
+            target.down = materialized_weight(backing, layer_source.down, DFlashConfig::hidden,
+                                              DFlashConfig::intermediate);
         }
         dflash2.final_norm =
             artifact::materialized_tensor(backing, source.final_norm, NumericFormat::BF16, {5120});
