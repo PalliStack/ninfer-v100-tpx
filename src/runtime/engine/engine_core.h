@@ -951,6 +951,23 @@ private:
         return cancelled;
     }
 
+    // Under TP lockstep the peer runs this same request, so the request's own cancellation flag is
+    // input for the agreed per-unit mask (tp_agree_cancellations) and never a decision this rank may
+    // take alone: dropping the request from the FIFO, or aborting its materialization, on one rank
+    // only leaves the peer inside GPU work this rank will never join. These accessors hide the flag
+    // from every rank-local decision point while a peer exists, mirroring snapshot_cancellations().
+    [[nodiscard]] CancellationFlagView
+    local_cancellation_view(const std::shared_ptr<Request>& request) const noexcept {
+        if (tp::Lockstep::instance() != nullptr) { return {}; }
+        return CancellationFlagView{&request->cancelled};
+    }
+
+    [[nodiscard]] bool cancelled_on_this_rank(
+        const std::shared_ptr<Request>& request) const noexcept {
+        return tp::Lockstep::instance() == nullptr &&
+               request->cancelled.load(std::memory_order_acquire);
+    }
+
     bool settle_terminal_requests(HostPhaseMeasurement& boundary) {
         const bool manager_transaction = resources_.context_transaction_kind().has_value();
         const bool program_transaction = instance_.program->has_context_transaction();
@@ -1030,11 +1047,13 @@ private:
             std::lock_guard lock(queue_mutex_);
             const auto now = Clock::now();
             for (auto it = pending_.begin(); it != pending_.end();) {
-                if ((*it)->cancelled.load(std::memory_order_acquire) &&
-                    tp::Lockstep::instance() == nullptr) {
+                if (cancelled_on_this_rank(*it)) {
                     cancelled.push_back(*it);
                     it = pending_.erase(it);
                 } else if (now >= (*it)->deadline) {
+                    // Queue expiry stays rank-local: both ranks derive it from the deadline their own
+                    // request lifetime started with, so the two decisions differ only by the arrival
+                    // skew between the ranks.
                     expired.push_back(*it);
                     it = pending_.erase(it);
                 } else {
@@ -1344,7 +1363,7 @@ private:
                 : static_cast<std::uint32_t>(blocked);
         const auto reserved = resources_.reserve_active_capture(
             *instance_.program, *request->lane, std::move(offer), blocked_runnable_requests,
-            CancellationFlagView{&request->cancelled});
+            local_cancellation_view(request));
         if (reserved == ResourceManagement::ActiveCaptureReserveResult::Skipped) { return; }
         request->capture_pending    = true;
         request->post_capture_state = post_capture_state;
@@ -1540,14 +1559,14 @@ private:
                 slots_[lane] != nullptr) {
                 throw std::logic_error("materializing request has invalid Engine ownership");
             }
-            cancellation = CancellationFlagView{&request->cancelled};
+            cancellation = local_cancellation_view(request);
             break;
         }
         case ContextTransactionKind::ActiveCapture:
             if (materializing_ || !capture) {
                 throw std::logic_error("active capture has conflicting Engine ownership");
             }
-            cancellation = CancellationFlagView{&capture->cancelled};
+            cancellation = local_cancellation_view(capture);
             break;
         }
 
@@ -1639,7 +1658,7 @@ private:
             if (progress == AdmissionProgress::ControlProgress) { request_admission_check(); }
             return progress;
         }
-        if (request->cancelled.load(std::memory_order_acquire)) {
+        if (cancelled_on_this_rank(request)) {
             if (!erase_pending(request)) { return AdmissionProgress::None; }
             on_waiting_removed(request);
             complete_detached_cancelled(request);
@@ -1678,7 +1697,7 @@ private:
 
         const auto reserved = resources_.reserve_materialization(
             *instance_.program, std::move(choice), std::move(request->prompt),
-            CancellationFlagView{&request->cancelled});
+            local_cancellation_view(request));
         if (reserved == ResourceManagement::MaterializationReserveResult::Stale) {
             request_admission_check();
             return AdmissionProgress::ControlProgress;
@@ -1728,7 +1747,7 @@ private:
             scheduler_.observe_fifo_head(head->id);
             // Under TP lockstep a queued request is never dropped on one rank's own cancellation
             // view: it is admitted like on the peer and cancelled by the agreed per-unit mask.
-            if (head->cancelled.load(std::memory_order_acquire) && tp::Lockstep::instance() == nullptr) {
+            if (cancelled_on_this_rank(head)) {
                 if (erase_pending(head)) {
                     on_waiting_removed(head);
                     complete_detached_cancelled(head);
@@ -1803,7 +1822,9 @@ private:
             }
 
             for (const std::shared_ptr<Request>& candidate : queued.backfill_candidates()) {
-                if (candidate->cancelled.load(std::memory_order_acquire)) {
+                // Same lockstep rule as the head scan: a backfill candidate is never dropped on this
+                // rank's own cancellation view while a peer runs the same request.
+                if (cancelled_on_this_rank(candidate)) {
                     if (erase_pending(candidate)) {
                         on_waiting_removed(candidate);
                         complete_detached_cancelled(candidate);

@@ -1,6 +1,7 @@
 #include "serve/generation_service.h"
 
 #include "product/media_acquire/acquire.h"
+#include "runtime/engine/tp_lockstep.h"
 #include "serve/translate.h"
 
 #include <algorithm>
@@ -93,6 +94,17 @@ namespace {
 using Clock = std::chrono::steady_clock;
 
 [[noreturn]] void throw_preparation_cancelled();
+
+// Preparation runs before the request reaches the Engine, so a cancellation observed here would be
+// a rank-local decision: rank 0 would drop the request while its peer keeps preparing it and then
+// blocks at the first lockstep exchange (the peer never publishes that unit), which stalls both
+// ranks until the supervisor restarts them. Under TP the cancellation is deferred instead so the
+// request is submitted with its cancellation view intact and both ranks abort it at the same unit
+// (tp_agree_cancellations). Single-process serving keeps acting on it immediately.
+[[nodiscard]] std::function<bool()> preparation_cancellation_view(std::function<bool()> is_cancelled) {
+    if (!ninfer::runtime::tp::lockstep_enabled()) { return is_cancelled; }
+    return {};
+}
 
 [[noreturn]] void throw_media_error(const ninfer::product::media_acquire::Error& exception) {
     ApiError error;
@@ -300,6 +312,7 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
                                                 CacheParticipation cache_participation,
                                                 DeadlinePolicy deadline_policy) const {
     PreparedRequest prepared;
+    is_cancelled = preparation_cancellation_view(std::move(is_cancelled));
     const ResolvedPromptSemantics semantics =
         resolve_prompt_semantics(request, options_, prompt_capabilities_);
     ninfer::RequestOptions request_options = to_request_options(

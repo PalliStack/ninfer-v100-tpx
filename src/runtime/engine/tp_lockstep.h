@@ -58,6 +58,19 @@ inline constexpr std::uint64_t kLockstepMagic = 0x4e494e4650325450ULL;  // "NINF
     std::abort();
 }
 
+// True when this process runs as one peer of a two-process tensor-parallel lockstep pair.
+//
+// Both ranks must issue the same GPU units in the same order, so a wall-clock, rank-local event
+// (an HTTP client going away, a per-rank deadline) must never change the engine work a rank
+// performs on its own: the peer holds the same request and would then wait at a unit this rank
+// will never publish, which stalls the pair until the supervisor restarts both ranks. Serving code
+// consults this before acting on such an event and defers instead — the request stays alive and is
+// ended by the agreed per-unit cancellation mask (tp_agree_cancellations).
+[[nodiscard]] inline bool lockstep_enabled() noexcept {
+    return std::getenv("NINFER_TP_RANK") != nullptr &&
+           std::getenv("NINFER_TP_LOCKSTEP_FILE") != nullptr;
+}
+
 class Lockstep {
   public:
     static Lockstep* instance() {
